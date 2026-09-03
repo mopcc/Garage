@@ -1,0 +1,38 @@
+name: Capture MurphyBeds Direct Configurator Assets
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - tmp-murphybed-configurator-assets
+    paths:
+      - 'tools/murphybeds-direct-assets.cjs'
+      - '.github/workflows/capture-murphybeds-direct-assets.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Download configurator CDN assets directly
+        run: node tools/murphybeds-direct-assets.cjs
+      - name: Show summary
+        if: always()
+        run: cat murphybeds-configurator-direct/summary.json || true
+      - name: Package configurator-only assets
+        if: always()
+        run: zip -r murphybeds-configurator-direct-assets.zip murphybeds-configurator-direct
+      - name: Upload configurator-only ZIP
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: murphybeds-configurator-direct-assets
+          path: murphybeds-configurator-direct-assets.zip
+          retention-days: 14
