@@ -1,4 +1,4 @@
-import asyncio, hashlib, json, os, re
+import asyncio, hashlib, json, os
 from pathlib import Path
 from urllib.parse import urlparse
 from playwright.async_api import async_playwright
@@ -49,7 +49,7 @@ async def click_text(page,text):
             total+=n or 0
         except: pass
     if total:
-        print('CLICK',text,total,flush=True); await page.wait_for_timeout(1300)
+        print('CLICK',text,total,flush=True); await page.wait_for_timeout(900)
     return total
 
 async def dump(page):
@@ -75,45 +75,18 @@ async def main():
             t=asyncio.create_task(save_response(r));tasks.add(t);t.add_done_callback(tasks.discard)
         page.on('response',on_resp)
         await page.goto(TARGET,wait_until='domcontentloaded',timeout=60000)
-        await page.wait_for_timeout(10000)
+        await page.wait_for_timeout(9000)
         diag.update(title=await page.title(),url=page.url)
         await dump(page)
-
-        # Current configurator option labels. Stay on the lowercase page; do not click Build Your Own link.
         for text in ['Vertical','Horizontal','Twin','Full','Queen','None','Left','Right','Both','Open','Closed']:
             await click_text(page,text)
         await page.wait_for_timeout(5000)
-
-        # Click visible configurator controls by keyword, but never navigation links.
-        kw=re.compile(r'cabinet|finish|door|side|width|open|closed|vertical|horizontal|twin|full|queen|left|right|both|none|color|colour',re.I)
-        clicked=set()
-        for _pass in range(3):
-            changed=0
-            for fr in page.frames:
-                try:
-                    els=await fr.evaluate("""
-                    ()=>[...document.querySelectorAll('button,[role=button],[role=radio],label,input[type=radio],input[type=checkbox]')].map((el,i)=>({i,text:(el.innerText||el.textContent||el.getAttribute('aria-label')||el.value||el.id||'').trim().replace(/\\s+/g,' ').slice(0,180)}))
-                    """)
-                    loc=fr.locator('button,[role=button],[role=radio],label,input[type=radio],input[type=checkbox]')
-                    for e in els:
-                        txt=e['text']; key=f'{fr.url}|{e["i"]}|{txt}'
-                        if key in clicked or not kw.search(txt) or re.search(r'build your own|customize a best seller|add to cart|checkout|view cart',txt,re.I): continue
-                        clicked.add(key)
-                        try:
-                            await loc.nth(e['i']).click(force=True,timeout=1200); changed+=1; await page.wait_for_timeout(650)
-                        except: pass
-                except: pass
-            print('PASS',_pass+1,'changed',changed,'assets',len(seen_hash),flush=True)
-            if not changed: break
-        await page.wait_for_timeout(5000)
         await dump(page)
         if tasks: await asyncio.gather(*list(tasks),return_exceptions=True)
-
-        # de-dupe manifest aliases
-        out=[]; seen=set()
+        out=[]; aliases=set()
         for r in manifest:
             k=(r['url'],r['file'])
-            if k not in seen: seen.add(k); out.append(r)
+            if k not in aliases: aliases.add(k); out.append(r)
         diag['unique_assets']=len(seen_hash)
         diag['manifest_rows']=len(out)
         diag['bunny_cdn_assets']=sum('murphy-beds-models.b-cdn.net' in r['url'] for r in out)
