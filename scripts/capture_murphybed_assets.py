@@ -155,33 +155,43 @@ async def dismiss_noise(page):
 
 async def enter_build_your_own(page):
     global capture_active
-    candidates = []
-    for frame in page.frames:
-        try:
-            loc = frame.get_by_text(re.compile(r"^\s*Build your own\s*$", re.I))
-            n = await loc.count()
-            for i in range(n):
-                candidates.append(loc.nth(i))
-        except Exception:
-            pass
-    if not candidates:
-        raise RuntimeError("Could not find the 'Build your own' control")
-
     capture_active = True
     last_error = None
-    for loc in reversed(candidates):
+
+    for frame in page.frames:
         try:
-            await loc.scroll_into_view_if_needed(timeout=3000)
-            await loc.click(timeout=5000)
-            await page.wait_for_timeout(4000)
-            try:
-                await page.wait_for_load_state("networkidle", timeout=12000)
-            except PlaywrightTimeoutError:
-                pass
-            return
+            result = await frame.evaluate("""
+            () => {
+              const els = [...document.querySelectorAll('a,button,[role=button],span,div')];
+              const hit = els.find(el => (el.textContent || '').trim().toLowerCase() === 'build your own');
+              if (!hit) return {ok:false};
+              const target = hit.closest('a,button,[role=button]') || hit;
+              const href = target.href || null;
+              target.click();
+              return {ok:true, tag:target.tagName, href};
+            }
+            """)
+            if result and result.get("ok"):
+                print("clicked Build your own via JS:", result)
+                await page.wait_for_timeout(5000)
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=12000)
+                except PlaywrightTimeoutError:
+                    pass
+                return result
         except Exception as exc:
             last_error = exc
-    raise RuntimeError(f"Found 'Build your own' but could not click it: {last_error}")
+
+    for frame in page.frames:
+        try:
+            loc = frame.get_by_text(re.compile(r"^\s*Build your own\s*$", re.I)).first
+            await loc.click(timeout=5000, force=True)
+            await page.wait_for_timeout(5000)
+            return {"ok": True, "fallback": True}
+        except Exception as exc:
+            last_error = exc
+
+    raise RuntimeError(f"Could not activate Build your own: {last_error}")
 
 
 async def inspect_controls(frame):
@@ -213,10 +223,9 @@ async def inspect_controls(frame):
 async def click_element_by_index(frame, idx):
     locator = frame.locator('input,select,button,[role=button],label').nth(idx)
     try:
-        await locator.scroll_into_view_if_needed(timeout=1500)
+        await locator.click(timeout=2500, force=True)
     except Exception:
-        pass
-    await locator.click(timeout=2500, force=True)
+        await locator.evaluate("el => { const t = el.closest('button,a,label,[role=button]') || el; t.click(); }")
 
 
 async def exercise_configurator(page, context):
@@ -225,7 +234,7 @@ async def exercise_configurator(page, context):
     base_host = urlparse(page.url).netloc
     safe_url = page.url
 
-    for pass_no in range(12):
+    for pass_no in range(16):
         changed = 0
         for frame in list(page.frames):
             controls = await inspect_controls(frame)
@@ -249,7 +258,7 @@ async def exercise_configurator(page, context):
                             try:
                                 await sel.select_option(opt["v"], timeout=2500)
                                 changed += 1
-                                await page.wait_for_timeout(500)
+                                await page.wait_for_timeout(550)
                             except Exception:
                                 pass
                     except Exception:
@@ -271,7 +280,7 @@ async def exercise_configurator(page, context):
                     before = page.url
                     await click_element_by_index(frame, c["i"])
                     changed += 1
-                    await page.wait_for_timeout(650)
+                    await page.wait_for_timeout(700)
                     now = page.url
                     bad_nav = urlparse(now).netloc != base_host or re.search(r"/(cart|checkout|products|collections)(/|$)", urlparse(now).path, re.I)
                     if bad_nav:
@@ -288,56 +297,71 @@ async def exercise_configurator(page, context):
             break
 
 
+async def write_outputs(diagnostics):
+    deduped = []
+    seen_rows = set()
+    for row in manifest:
+        k = (row["url"], row["file"], row["source"])
+        if k not in seen_rows:
+            seen_rows.add(k)
+            deduped.append(row)
+    diagnostics["unique_images"] = len(saved_hashes)
+    diagnostics["manifest_rows"] = len(deduped)
+    (OUT / "manifest.json").write_text(json.dumps(deduped, indent=2), encoding="utf-8")
+    (OUT / "network.json").write_text(json.dumps(network_log, indent=2), encoding="utf-8")
+    (OUT / "diagnostics.json").write_text(json.dumps(diagnostics, indent=2), encoding="utf-8")
+    (OUT / "urls.txt").write_text("\n".join(sorted({r["url"] for r in deduped})) + "\n", encoding="utf-8")
+
+
 async def main():
     diagnostics = {"target": TARGET}
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=["--disable-dev-shm-usage", "--no-sandbox"])
-        context = await browser.new_context(
-            viewport={"width": 1600, "height": 1100},
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/152 Safari/537.36",
-        )
-        page = await context.new_page()
+    browser = None
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True, args=["--disable-dev-shm-usage", "--no-sandbox"])
+            context = await browser.new_context(
+                viewport={"width": 1600, "height": 1100},
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/152 Safari/537.36",
+            )
+            page = await context.new_page()
 
-        def on_response(resp):
-            task = asyncio.create_task(handle_response(resp))
-            active_tasks.add(task)
-            task.add_done_callback(active_tasks.discard)
+            def on_response(resp):
+                task = asyncio.create_task(handle_response(resp))
+                active_tasks.add(task)
+                task.add_done_callback(active_tasks.discard)
 
-        page.on("response", on_response)
-        await page.goto(TARGET, wait_until="domcontentloaded", timeout=60000)
-        await page.wait_for_timeout(5000)
-        await dismiss_noise(page)
-        diagnostics["initial_url"] = page.url
-        diagnostics["initial_title"] = await page.title()
+            page.on("response", on_response)
+            await page.goto(TARGET, wait_until="domcontentloaded", timeout=60000)
+            await page.wait_for_timeout(5000)
+            await dismiss_noise(page)
+            diagnostics["initial_url"] = page.url
+            diagnostics["initial_title"] = await page.title()
 
-        await enter_build_your_own(page)
-        diagnostics["config_url"] = page.url
-        diagnostics["config_title"] = await page.title()
-        await collect_dom_asset_urls(page, context)
-        await exercise_configurator(page, context)
-        await page.wait_for_timeout(3500)
-        await collect_dom_asset_urls(page, context)
+            diagnostics["entry"] = await enter_build_your_own(page)
+            diagnostics["config_url"] = page.url
+            diagnostics["config_title"] = await page.title()
+            await collect_dom_asset_urls(page, context)
+            await exercise_configurator(page, context)
+            await page.wait_for_timeout(3500)
+            await collect_dom_asset_urls(page, context)
 
+            if active_tasks:
+                await asyncio.gather(*list(active_tasks), return_exceptions=True)
+            await write_outputs(diagnostics)
+            print(json.dumps(diagnostics, indent=2))
+            await browser.close()
+    except Exception as exc:
+        diagnostics["error"] = repr(exc)
         if active_tasks:
             await asyncio.gather(*list(active_tasks), return_exceptions=True)
-
-        # De-dupe manifest rows by (url,file,source) while preserving all URL aliases.
-        deduped = []
-        seen_rows = set()
-        for row in manifest:
-            k = (row["url"], row["file"], row["source"])
-            if k not in seen_rows:
-                seen_rows.add(k)
-                deduped.append(row)
-
-        diagnostics["unique_images"] = len(saved_hashes)
-        diagnostics["manifest_rows"] = len(deduped)
-        (OUT / "manifest.json").write_text(json.dumps(deduped, indent=2), encoding="utf-8")
-        (OUT / "network.json").write_text(json.dumps(network_log, indent=2), encoding="utf-8")
-        (OUT / "diagnostics.json").write_text(json.dumps(diagnostics, indent=2), encoding="utf-8")
-        (OUT / "urls.txt").write_text("\n".join(sorted({r["url"] for r in deduped})) + "\n", encoding="utf-8")
+        await write_outputs(diagnostics)
         print(json.dumps(diagnostics, indent=2))
-        await browser.close()
+        if browser:
+            try:
+                await browser.close()
+            except Exception:
+                pass
+        raise
 
 
 if __name__ == "__main__":
