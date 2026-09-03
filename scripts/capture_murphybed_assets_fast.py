@@ -1,37 +1,44 @@
-import asyncio, hashlib, json, os
+import asyncio, hashlib, json, os, re
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, unquote
 from playwright.async_api import async_playwright
 
 TARGET=os.getenv('TARGET_URL','https://www.murphybeds.com/pages/buildabed')
 OUT=Path(os.getenv('OUTPUT_DIR','murphybed_assets'))
 ASSET=OUT/'assets'; ASSET.mkdir(parents=True,exist_ok=True)
-seen_hash={}; manifest=[]; network=[]; tasks=set()
+network=[]; static_urls=set(); manifest=[]; hashes={}
 EXTS={'.png','.jpg','.jpeg','.webp','.avif','.gif','.svg','.glb','.gltf','.hdr','.bin'}
-CT_EXT={'image/png':'.png','image/jpeg':'.jpg','image/webp':'.webp','image/avif':'.avif','image/gif':'.gif','image/svg+xml':'.svg','model/gltf-binary':'.glb','model/gltf+json':'.gltf'}
+CDN_HOSTS=('murphy-beds-models.b-cdn.net','murphy-beds-retail.myshopify.com','cdn.shopify.com','cdn.shopifycdn.net')
 
-def want(url,ct):
-    ext=Path(urlparse(url).path).suffix.lower(); ct=(ct or '').lower()
-    return ct.startswith('image/') or ct.startswith('model/') or ext in EXTS or 'murphy-beds-models.b-cdn.net' in url
+def static_candidate(url,ct=''):
+    if not url.startswith('http'): return False
+    host=urlparse(url).netloc.lower(); path=urlparse(url).path.lower()
+    if not any(h in host for h in CDN_HOSTS): return False
+    if 'recommended-build-' in url.lower(): return False
+    ext=Path(path).suffix.lower()
+    return ext in EXTS or 'murphy-beds-models.b-cdn.net' in host or (ct or '').lower().startswith(('image/','model/'))
 
-def ext_for(url,ct):
-    e=Path(urlparse(url).path).suffix.lower()
-    return e if e in EXTS else CT_EXT.get((ct or '').split(';')[0].lower(),'.bin')
+def clean_name(url, fallback):
+    p=Path(unquote(urlparse(url).path)); name=p.name
+    name=re.sub(r'[^A-Za-z0-9._-]+','_',name)
+    return name if name and len(name)<180 else fallback
 
-async def save_response(resp):
+async def download_one(ctx,url):
     try:
-        ct=(resp.headers.get('content-type') or '').lower(); u=resp.url
-        network.append({'url':u,'status':resp.status,'content_type':ct})
-        if not want(u,ct): return
-        b=await resp.body()
-        if not b: return
-        h=hashlib.sha256(b).hexdigest(); e=ext_for(u,ct)
-        if h not in seen_hash:
-            fn=f'{h[:20]}{e}'; (ASSET/fn).write_bytes(b); seen_hash[h]=fn
-        else: fn=seen_hash[h]
-        manifest.append({'url':u,'file':f'assets/{fn}','sha256':h,'bytes':len(b),'content_type':ct,'status':resp.status})
+        r=await ctx.request.get(url,timeout=12000)
+        if not r.ok: return {'url':url,'error':f'HTTP {r.status}'}
+        b=await asyncio.wait_for(r.body(),timeout=12)
+        if not b: return {'url':url,'error':'empty'}
+        h=hashlib.sha256(b).hexdigest(); ext=Path(urlparse(url).path).suffix.lower() or '.bin'
+        if h in hashes:
+            fn=hashes[h]
+        else:
+            base=clean_name(url,f'{h[:20]}{ext}')
+            fn=f'{h[:10]}__{base}'
+            (ASSET/fn).write_bytes(b); hashes[h]=fn
+        return {'url':url,'file':f'assets/{fn}','sha256':h,'bytes':len(b),'content_type':r.headers.get('content-type',''),'status':r.status}
     except Exception as ex:
-        network.append({'url':getattr(resp,'url','?'),'error':str(ex)})
+        return {'url':url,'error':repr(ex)}
 
 async def click_text(page,text):
     total=0
@@ -49,7 +56,7 @@ async def click_text(page,text):
             total+=n or 0
         except: pass
     if total:
-        print('CLICK',text,total,flush=True); await page.wait_for_timeout(900)
+        print('CLICK',text,total,flush=True); await page.wait_for_timeout(800)
     return total
 
 async def dump(page):
@@ -72,7 +79,11 @@ async def main():
         ctx=await browser.new_context(viewport={'width':1800,'height':1400},user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/152 Safari/537.36')
         page=await ctx.new_page()
         def on_resp(r):
-            t=asyncio.create_task(save_response(r));tasks.add(t);t.add_done_callback(tasks.discard)
+            try:
+                ct=r.headers.get('content-type',''); u=r.url
+                network.append({'url':u,'status':r.status,'content_type':ct})
+                if static_candidate(u,ct): static_urls.add(u)
+            except: pass
         page.on('response',on_resp)
         await page.goto(TARGET,wait_until='domcontentloaded',timeout=60000)
         await page.wait_for_timeout(9000)
@@ -80,21 +91,24 @@ async def main():
         await dump(page)
         for text in ['Vertical','Horizontal','Twin','Full','Queen','None','Left','Right','Both','Open','Closed']:
             await click_text(page,text)
-        await page.wait_for_timeout(5000)
+        await page.wait_for_timeout(4500)
         await dump(page)
-        if tasks: await asyncio.gather(*list(tasks),return_exceptions=True)
-        out=[]; aliases=set()
-        for r in manifest:
-            k=(r['url'],r['file'])
-            if k not in aliases: aliases.add(k); out.append(r)
-        diag['unique_assets']=len(seen_hash)
-        diag['manifest_rows']=len(out)
-        diag['bunny_cdn_assets']=sum('murphy-beds-models.b-cdn.net' in r['url'] for r in out)
-        diag['glb_assets']=sum(r['file'].endswith('.glb') for r in out)
-        diag['image_assets']=sum(r['content_type'].startswith('image/') for r in out)
-        (OUT/'manifest.json').write_text(json.dumps(out,indent=2),encoding='utf-8')
+        urls=sorted(static_urls)
+        print('STATIC CDN URLS',len(urls),flush=True)
+        # Download with bounded concurrency and hard timeouts.
+        sem=asyncio.Semaphore(8)
+        async def bounded(u):
+            async with sem: return await download_one(ctx,u)
+        results=await asyncio.gather(*(bounded(u) for u in urls))
+        manifest.extend(results)
+        ok=[r for r in results if r.get('file')]
+        diag['static_cdn_urls']=len(urls); diag['downloaded_assets']=len(ok); diag['unique_files']=len(hashes)
+        diag['bunny_cdn_assets']=sum('murphy-beds-models.b-cdn.net' in r['url'] for r in ok)
+        diag['glb_assets']=sum(r['file'].endswith('.glb') for r in ok)
+        diag['shopify_cdn_assets']=sum('myshopify.com' in r['url'] or 'shopify' in urlparse(r['url']).netloc for r in ok)
+        (OUT/'manifest.json').write_text(json.dumps(manifest,indent=2),encoding='utf-8')
         (OUT/'network.json').write_text(json.dumps(network,indent=2),encoding='utf-8')
-        (OUT/'urls.txt').write_text('\n'.join(sorted({r['url'] for r in out}))+'\n',encoding='utf-8')
+        (OUT/'urls.txt').write_text('\n'.join(urls)+'\n',encoding='utf-8')
         (OUT/'diagnostics.json').write_text(json.dumps(diag,indent=2),encoding='utf-8')
         print(json.dumps(diag,indent=2),flush=True)
         await browser.close()
