@@ -1,0 +1,71 @@
+name: Capture MurphyBeds Configurator Assets
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - tmp-murphybed-configurator-assets
+    paths:
+      - 'tools/murphybeds-crawler.cjs'
+      - '.github/workflows/capture-murphybeds-configurator.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout temporary branch
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install Playwright
+        run: |
+          npm init -y
+          npm install playwright@latest
+          npx playwright install --with-deps chromium
+
+      - name: Run configurator crawler
+        env:
+          OUT_DIR: murphybeds-configurator-capture
+        run: node tools/murphybeds-crawler.cjs
+
+      - name: Show capture summary
+        if: always()
+        run: |
+          echo '--- capture-summary.json ---'
+          cat murphybeds-configurator-capture/capture-summary.json || true
+          echo '--- asset count ---'
+          find murphybeds-configurator-capture/assets -type f | wc -l || true
+
+      - name: Package assets
+        if: always()
+        run: |
+          if [ -d murphybeds-configurator-capture ]; then
+            zip -r murphybeds-configurator-assets.zip murphybeds-configurator-capture
+          fi
+
+      - name: Upload ZIP artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: murphybeds-configurator-assets
+          path: murphybeds-configurator-assets.zip
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload raw capture artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: murphybeds-configurator-capture-raw
+          path: murphybeds-configurator-capture/
+          if-no-files-found: warn
+          retention-days: 14
